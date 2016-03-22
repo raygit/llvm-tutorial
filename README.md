@@ -10,5 +10,5 @@ What happened
 --------------------
 
 [21 March 2016] - First drop of the lexer
-
+[22 March 2016] - First drop of the code generator in LLVM IR
 
