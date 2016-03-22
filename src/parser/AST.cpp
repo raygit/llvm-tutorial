@@ -1,3 +1,9 @@
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -5,6 +11,24 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+
+using namespace llvm;
+
+/*
+* To build this program, the command to do it via clang++ is:
+* 
+* /Users/raymondtay/llvm/build/./bin/clang++ \
+* -std=c++14 \
+* -I/Users/raymondtay/llvm/include \
+* -I/Users/raymondtay/llvm/build/include -g -O3 ./AST.cpp \
+* `/Users/raymondtay/llvm/build/bin/llvm-config --cxxflags --ldflags --system-libs --libs core` \
+* -D__STDC_LIMIT_MACROS -o ./lexer
+* 
+* Note:
+* (a) llvm is checked out to /Users/raymondtay/llvm directory
+* (b) llvm is build to /Users/raymondtay/llvm/build
+* (c) There are two include directories here which houses different header files clang++ is looking for
+*/
 
 namespace helper {
 
@@ -89,24 +113,63 @@ static int gettok() {
 
 namespace {
 
+  /**
+   * the codegen() method says to emit IR for that AST node along with all the things 
+   * it depends on, and they all return an LLVM Value object. 
+   * "Value" is the class used to represent a "Static Single Assignment" i.e.SSA
+   */
+static std::unique_ptr<Module> TheModule;
+static IRBuilder<> Builder(getGlobalContext());
+static std::map<std::string, Value*> NamedValues;
+
+
 class ExprAST {
   public:
     virtual ~ExprAST() {}
+    virtual Value *codegen() = 0;
 };
+
+std::unique_ptr<ExprAST> Error(const char* Str) {
+  fprintf(stderr, "Error: %s\n", Str);
+  return nullptr;
+}
+
+Value* ErrorV(const char* str) {
+  Error(str);
+  return nullptr;
+}
 
 class NumberExprAST : public ExprAST {
 private:
   double val;
 public:
   NumberExprAST(double val) : val(val) {}
+  virtual Value *codegen() ;
 };
 
+// 
+// In the LLVM IR, numeric constants are represented with the ConstantFP class, which holds
+// the numeric value in a APFloat internally (APFloat has the capability of holding floating point
+// constants of Arbitrary Precisions).  This code basically just creates and returns a ConstantFP.
+// Note that in the LLVM IR that constants are all uniqued together and shared. For this reason, the API
+// uses the "foo::get(...)" instead of the "new foo(...)" or "foo::Create()".
+//
+Value* NumberExprAST::codegen() {
+  return ConstantFP::get(getGlobalContext(), APFloat(val));
+}
 
 class VariableExprAST : public ExprAST {
   std::string Name;
   public:
   VariableExprAST(const std::string& name) : Name(name) {}
+  Value* codegen() ;
 };
+
+Value* VariableExprAST::codegen() {
+  Value* v = NamedValues[Name];
+  if (!v) ErrorV("Unknown variable name");
+  return v;
+}
 
 class BinaryExprAST : public ExprAST {
   char Op;
@@ -115,7 +178,29 @@ class BinaryExprAST : public ExprAST {
   BinaryExprAST(char op, 
                 std::unique_ptr<ExprAST> LHS, 
                 std::unique_ptr<ExprAST> RHS) : Op(op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+  Value* codegen() ;
 };
+
+Value* BinaryExprAST::codegen() {
+  Value *L = LHS->codegen();
+  Value* R = RHS->codegen();
+  if (!L || !R) return nullptr;
+
+  switch(Op) {
+    case '+':
+      return Builder.CreateFAdd(L, R, "addtmp");
+    case '-':
+      return Builder.CreateFSub(L, R, "subtmp");
+    case '*':
+      return Builder.CreateFMul(L, R, "multmp");
+    case '<': 
+      L = Builder.CreateFCmpULT(L, R, "divtmp");
+      return Builder.CreateUIToFP(L, Type::getDoubleTy(getGlobalContext()),
+                                  "booltmp");
+    default:
+      return ErrorV("Invalid binary operator");
+  }
+}
 
 class CallExprAST : public ExprAST {
   std::string Callee;
@@ -124,7 +209,23 @@ class CallExprAST : public ExprAST {
     CallExprAST(const std::string& Callee, 
                 std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
+    Value* codegen();
 };
+
+Value* CallExprAST::codegen() {
+  Function* CalleeF = TheModule->getFunction(Callee);
+  if(!CalleeF) return ErrorV("Unknown function reference");
+
+  if(CalleeF->arg_size() != Args.size()) return ErrorV("Incorrect # arguments passed");
+
+  std::vector<Value*> ArgsV;
+  for(unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if(!ArgsV.back())
+      return nullptr;
+  }
+  return Builder.CreateCall(CalleeF, ArgsV, "calltmp");
+}
 
 class PrototypeAST {
   std::string Name;
@@ -132,7 +233,20 @@ class PrototypeAST {
   public:
   PrototypeAST(const std::string&name, std::vector<std::string> args) :
     Args(std::move(args)), Name(name) {}
+  Function* codegen();
+  const std::string& getName() const { return Name; }
 };
+
+Function* PrototypeAST::codegen() {
+  std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(getGlobalContext()));
+  FunctionType* FT = FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false);
+
+  Function* F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule.get());
+  unsigned index = 0;
+  for(auto & arg: F->args())
+    arg.setName(Args[index++]);
+
+}
 
 class FunctionAST {
   std::unique_ptr<PrototypeAST> Proto;
@@ -141,7 +255,37 @@ class FunctionAST {
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body) :
     Proto(std::move(Proto)), Body(std::move(Body)) {}
+  Function* codegen();
 };
+
+Function* FunctionAST::codegen() {
+  Function* TheFunction = TheModule->getFunction(Proto->getName());
+
+  if(!TheFunction) TheFunction = Proto->codegen();
+
+  if(!TheFunction) return nullptr;
+
+  if(!TheFunction->empty()) return (Function*)ErrorV("Function cannot be redefined.");
+
+  BasicBlock* BB = BasicBlock::Create(getGlobalContext(), "entry", TheFunction);
+  Builder.SetInsertPoint(BB);
+
+  NamedValues.clear();
+  for(auto & arg : TheFunction->args())
+    NamedValues[arg.getName()] = &arg;
+
+  if(Value* RetVal = Body->codegen()) {
+    Builder.CreateRet(RetVal);
+
+    verifyFunction(*TheFunction);
+    return TheFunction;
+  }
+
+  TheFunction->eraseFromParent();
+  return nullptr;
+}
+
+
 } // end of namespace
 
 //===----------------------------------------------------------------------===//
@@ -154,11 +298,6 @@ class FunctionAST {
 static int CurTok;
 static int getNextToken() {
   return CurTok = gettok();
-}
-
-std::unique_ptr<ExprAST> Error(const char* Str) {
-  fprintf(stderr, "Error: %s\n", Str);
-  return nullptr;
 }
 
 std::unique_ptr<PrototypeAST> ErrorP(const char* Str) {
@@ -344,8 +483,11 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 //
 
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definition.\n");
+  if (auto f = ParseDefinition()) {
+    if(auto g = f->codegen()) {
+      fprintf(stderr, "Read a function definition.\n");
+      g->dump();
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -353,8 +495,11 @@ static void HandleDefinition() {
 }
 
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed an extern\n");
+  if (auto f = ParseExtern()) {
+    if(auto g = f->codegen()) {
+      fprintf(stderr, "Parsed an extern\n");
+      g->dump();
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -363,8 +508,11 @@ static void HandleExtern() {
 
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level expr\n");
+  if (auto f = ParseTopLevelExpr()) {
+    if (auto g = f->codegen()) {
+      fprintf(stderr, "Parsed a top-level expr\n");
+      g->dump();
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -409,8 +557,14 @@ int main() {
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
-  
+
+  TheModule = llvm::make_unique<Module>("my cool jit", getGlobalContext());
+
   // Run the main "interpreter loop" now.
   MainLoop();
+
+  TheModule->dump();
+
+  return 0;
 }
 
